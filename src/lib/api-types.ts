@@ -322,12 +322,24 @@ export interface CMSFormFieldChoice {
 export interface CMSFormField {
   id: string;
   name: string;
+  /**
+   * text | email | phone | number | url | textarea | richtext | select | multiselect |
+   * radio | checkbox | checkboxGroup | date | time | datetime | file, plus the display-only
+   * `heading` / `paragraph` (text lives in `label`, never submitted).
+   */
   type: string;
   label: string;
   required?: boolean;
   placeholder?: string;
+  helpText?: string;
+  order?: number;
+  width?: 'full' | 'half';
   settings?: {
     choices?: CMSFormFieldChoice[];
+    /** `file` fields: allowed groups (documents / images / spreadsheets); empty = all. */
+    fileTypes?: string[];
+    /** `file` fields: per-file limit in MB (1–3, default 3). */
+    maxSizeMB?: number;
   };
 }
 

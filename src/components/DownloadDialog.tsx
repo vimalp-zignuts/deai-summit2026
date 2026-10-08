@@ -9,6 +9,17 @@ import {
   unlockDownloadForm,
 } from '@/lib/downloadFormUnlock';
 import type { CMSDocument, CMSFormConfig, CMSFormField } from '@/lib/api-types';
+import {
+  checkPickedFile,
+  fileAcceptAttribute,
+  fileMaxSizeMB,
+  fileTypesSummary,
+  formatFileSize,
+  isDisplayOnlyField,
+  readFileAsBase64,
+  totalFileBytes,
+  type FormFileValue,
+} from '@/lib/formFields';
 
 type DownloadDialogProps = {
   doc: CMSDocument | null;
@@ -162,6 +173,9 @@ export function DownloadDialog({
   /** Hide email CTA right after form submit — that flow already mailed this document. */
   const [suppressEmailAction, setSuppressEmailAction] = useState(false);
   const [values, setValues] = useState<Record<string, string>>({});
+  /** `file` field values (base64 inside the JSON submit body); null = nothing chosen. */
+  const [fileValues, setFileValues] = useState<Record<string, FormFileValue | null>>({});
+  const [fileErrors, setFileErrors] = useState<Record<string, string>>({});
 
   const formKey = gateForm?.id || gateForm?.form_slug || '';
   const formCaptchaEnabled = gateForm?.form_settings?.captcha?.enabled === true;
@@ -194,6 +208,8 @@ export function DownloadDialog({
       setErrorMessage('');
       setSuccessMessage('');
       setValues({});
+      setFileValues({});
+      setFileErrors({});
       captchaWidgetId.current = null;
       const already = needsGate ? isDownloadFormUnlocked(formKey) : true;
       setUnlocked(already);
@@ -427,18 +443,73 @@ export function DownloadDialog({
     setUnlocked(true);
   };
 
+  const handleFileChange = async (field: CMSFormField, input: HTMLInputElement) => {
+    const file = input.files?.[0];
+    setFileErrors((prev) => ({ ...prev, [field.name]: '' }));
+    if (!file) return;
+
+    const reject = (message: string) => {
+      setFileErrors((prev) => ({ ...prev, [field.name]: message }));
+      setFileValues((prev) => ({ ...prev, [field.name]: null }));
+      input.value = '';
+    };
+
+    const check = checkPickedFile({
+      field,
+      file,
+      otherFilesBytes: totalFileBytes(fileValues, field.name),
+    });
+    if (!check.ok) {
+      reject(
+        check.reason === 'type'
+          ? "This file type isn't allowed."
+          : check.reason === 'size'
+            ? `This file is too large (max ${fileMaxSizeMB(field)} MB).`
+            : 'The files you attached are over the 3 MB total limit.',
+      );
+      return;
+    }
+
+    try {
+      const data = await readFileAsBase64(file);
+      setFileValues((prev) => ({
+        ...prev,
+        [field.name]: { name: file.name, type: file.type, size: file.size, data },
+      }));
+    } catch {
+      reject("We couldn't read that file. Please try another one.");
+    }
+  };
+
+  const removeFile = (field: CMSFormField) => {
+    setFileErrors((prev) => ({ ...prev, [field.name]: '' }));
+    setFileValues((prev) => ({ ...prev, [field.name]: null }));
+    const input = document.getElementById(`dl-field-${field.name}`);
+    if (input instanceof HTMLInputElement) input.value = '';
+  };
+
   const handleFormSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!gateForm || submitting) return;
 
     for (const field of fields) {
-      if (field.required && !String(values[field.name] || '').trim()) {
-        setErrorMessage(`Please fill in ${field.label}.`);
+      if (isDisplayOnlyField(field) || !field.required) continue;
+      const missing =
+        field.type === 'file'
+          ? !fileValues[field.name]
+          : !String(values[field.name] || '').trim();
+      if (missing) {
+        setErrorMessage(
+          field.type === 'file' ? `Please attach a file for ${field.label}.` : `Please fill in ${field.label}.`,
+        );
         return;
       }
     }
 
-    const email = extractEmailFromValues(values, fields);
+    const email = extractEmailFromValues(
+      values,
+      fields.filter((f) => !isDisplayOnlyField(f) && f.type !== 'file'),
+    );
     if (!email) {
       setErrorMessage('Please enter a valid email address.');
       return;
@@ -460,7 +531,11 @@ export function DownloadDialog({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          submission_data: values,
+          // Display-only fields never hold a value; a file key is omitted when nothing was chosen.
+          submission_data: {
+            ...values,
+            ...Object.fromEntries(Object.entries(fileValues).filter(([, v]) => v !== null)),
+          },
           captchaToken,
           ...(documentPath ? { download_request: { document_path: documentPath } } : {}),
         }),
@@ -655,8 +730,83 @@ export function DownloadDialog({
             <form className="space-y-4" onSubmit={handleFormSubmit}>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 {fields.map((field) => {
+                  if (field.type === 'heading') {
+                    return (
+                      <h3
+                        key={field.id || field.name}
+                        className="sm:col-span-2 text-sm font-bold text-slate-900"
+                      >
+                        {field.label}
+                      </h3>
+                    );
+                  }
+                  if (field.type === 'paragraph') {
+                    return (
+                      <p
+                        key={field.id || field.name}
+                        className="sm:col-span-2 whitespace-pre-line text-sm text-slate-500"
+                      >
+                        {field.label}
+                      </p>
+                    );
+                  }
+                  if (field.type === 'file') {
+                    const current = fileValues[field.name] ?? null;
+                    const fileError = fileErrors[field.name];
+                    return (
+                      <div key={field.id || field.name} className={`space-y-1.5 ${fieldWidthClass(field)}`}>
+                        <label
+                          htmlFor={`dl-field-${field.name}`}
+                          className="text-xs font-semibold uppercase tracking-wider text-slate-500"
+                        >
+                          {field.label}
+                          {field.required ? <span className="text-brand-cyan"> *</span> : null}
+                        </label>
+                        {current ? (
+                          <div className="flex items-center justify-between gap-3 px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-900">
+                            <span className="min-w-0 truncate" title={current.name}>
+                              {current.name}{' '}
+                              <span className="text-xs text-slate-400">({formatFileSize(current.size)})</span>
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => removeFile(field)}
+                              className="shrink-0 text-xs font-semibold text-brand-cyan hover:text-[#050A1F] transition-colors"
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        ) : null}
+                        <input
+                          id={`dl-field-${field.name}`}
+                          type="file"
+                          hidden={current !== null}
+                          accept={fileAcceptAttribute(field)}
+                          aria-required={field.required ? true : undefined}
+                          aria-invalid={fileError ? true : undefined}
+                          onChange={(e) => void handleFileChange(field, e.target)}
+                          className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-brand-cyan/20 focus:border-brand-cyan transition-all"
+                        />
+                        <p className="text-xs text-slate-400">
+                          {fileTypesSummary(field)} · max {fileMaxSizeMB(field)} MB
+                        </p>
+                        {field.helpText ? <p className="text-xs text-slate-400">{field.helpText}</p> : null}
+                        {fileError ? (
+                          <p className="text-xs text-red-600" role="alert">
+                            {fileError}
+                          </p>
+                        ) : null}
+                      </div>
+                    );
+                  }
                   const inputType =
-                    field.type === 'email' ? 'email' : field.type === 'phone' ? 'tel' : 'text';
+                    field.type === 'email'
+                      ? 'email'
+                      : field.type === 'phone'
+                        ? 'tel'
+                        : field.type === 'datetime'
+                          ? 'datetime-local'
+                          : 'text';
                   const isTextarea = field.type === 'textarea' || field.type === 'richtext';
                   return (
                     <div key={field.id || field.name} className={`space-y-1.5 ${fieldWidthClass(field)}`}>
